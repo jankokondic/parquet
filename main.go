@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
+
 	"root/gen-go/parquet"
 
 	"github.com/apache/thrift/lib/go/thrift"
@@ -53,28 +55,42 @@ func ReadParquetFooter(f *os.File) (*parquet.FileMetaData, error) {
 	return meta, nil
 }
 
+// ReadPageHeaderAndDataOffset čita PageHeader sa datog offseta i vraća:
+// - header: dekodirani PageHeader
+// - pageDataOffset: offset na početak kompresovanih podataka stranice
 func ReadPageHeaderAndDataOffset(f *os.File, offset int64) (*parquet.PageHeader, int64, error) {
-	// Postavi file offset na početak page-a
-	_, err := f.Seek(offset, 0)
-	if err != nil {
-		return nil, 0, fmt.Errorf("seek failed: %w", err)
+	const maxHeaderSize = 64 * 1024 // 64 KB, dovoljno za PageHeader
+
+	headerBuf := make([]byte, maxHeaderSize)
+	n, err := f.ReadAt(headerBuf, offset)
+	if err != nil && err != io.EOF {
+		return nil, 0, fmt.Errorf("failed reading potential page header bytes: %w", err)
+	}
+	if n == 0 {
+		return nil, 0, fmt.Errorf("no bytes read for page header at offset %d", offset)
 	}
 
-	// Transport direktno nad fajlom
-	transport := thrift.NewStreamTransportR(f)
-	protocol := thrift.NewTCompactProtocolFactoryConf(&thrift.TConfiguration{}).GetProtocol(transport)
+	mem := thrift.NewTMemoryBufferLen(n)
+	_, err = mem.Write(headerBuf[:n])
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to write header bytes to memory buffer: %w", err)
+	}
 
+	beforeLen := mem.Len()
+
+	protocol := thrift.NewTCompactProtocolFactoryConf(&thrift.TConfiguration{}).GetProtocol(mem)
 	header := parquet.NewPageHeader()
 	if err := header.Read(context.Background(), protocol); err != nil {
 		return nil, 0, fmt.Errorf("failed reading page header: %w", err)
 	}
 
-	// Transport je direktno nad fajlom → tell(f) = offset page data
-	pageDataOffset, err := f.Seek(0, 1) // vrati trenutni offset
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed getting file offset: %w", err)
+	afterLen := mem.Len()
+	consumed := int64(beforeLen - afterLen)
+	if consumed <= 0 {
+		return nil, 0, fmt.Errorf("invalid consumed header length %d at offset %d", consumed, offset)
 	}
 
+	pageDataOffset := offset + consumed
 	return header, pageDataOffset, nil
 }
 
@@ -90,34 +106,76 @@ func main() {
 		panic(fmt.Errorf("failed to read parquet footer: %w", err))
 	}
 
-	for _, rg := range meta.RowGroups {
-		for _, col := range rg.Columns {
-			offset := col.MetaData.DataPageOffset
-			end := col.FileOffset + col.MetaData.TotalCompressedSize
+	for rgIdx, rg := range meta.RowGroups {
+		fmt.Println("RowGroup:", rgIdx)
 
-			for offset < end {
+		for colIdx, col := range rg.Columns {
+			md := col.MetaData
+			if md == nil {
+				fmt.Println("  Column", colIdx, "has nil MetaData, skipping")
+				continue
+			}
+
+			decoder := md.Codec
+			dataPageOffset := md.DataPageOffset
+			numValuesTotal := md.NumValues
+
+			fmt.Println("  Column:", colIdx,
+				"decoder:", decoder,
+				"dataPageOffset:", dataPageOffset,
+				"numValues:", numValuesTotal)
+
+			offset := dataPageOffset
+			var valuesRead int64
+			pageIdx := 0
+
+			// Glavna razlika: petlja ide dok ne pročitaš sve vrijednosti (NumValues),
+			// a NE dok offset < dataPageOffset + totalCompressedSize.
+			for valuesRead < numValuesTotal {
 				header, pageDataOffset, err := ReadPageHeaderAndDataOffset(f, offset)
 				if err != nil {
-					fmt.Println("Failed reading page header:", err)
+					fmt.Println("    Failed reading page header at", offset, ":", err)
 					break
 				}
 
-				fmt.Printf("Page at offset %d, type=%v, compressed=%d, uncompressed=%d\n",
-					pageDataOffset, header.Type, header.CompressedPageSize, header.UncompressedPageSize)
+				fmt.Printf("    Page %d: headerOffset=%d, dataOffset=%d, type=%v, compressed=%d, uncompressed=%d\n",
+					pageIdx, offset, pageDataOffset, header.Type, header.CompressedPageSize, header.UncompressedPageSize)
 
-				// Čitaj page data direktno
-				pageData := make([]byte, header.CompressedPageSize)
-				_, err = f.ReadAt(pageData, pageDataOffset)
-				if err != nil {
-					fmt.Println("Failed reading page data:", err)
-					break
+				// Ažuriraj brojač vrijednosti samo za data page-ove
+				switch header.Type {
+				case parquet.PageType_DATA_PAGE:
+					if header.DataPageHeader == nil {
+						fmt.Println("      DATA_PAGE but DataPageHeader is nil")
+						return
+					}
+					valuesRead += int64(header.DataPageHeader.NumValues)
+
+				case parquet.PageType_DATA_PAGE_V2:
+					if header.DataPageHeaderV2 == nil {
+						fmt.Println("      DATA_PAGE_V2 but DataPageHeaderV2 is nil")
+						return
+					}
+					valuesRead += int64(header.DataPageHeaderV2.NumValues)
+
+				default:
+					// DICTIONARY_PAGE, INDEX_PAGE itd. – ovdje ne mijenjamo valuesRead
 				}
 
-				//dekompresovati sad treba te podatke
+				// (Ako želiš čitati page data, ovdje bi išlo:)
+				// pageData := make([]byte, header.CompressedPageSize)
+				// _, err = f.ReadAt(pageData, pageDataOffset)
+				// if err != nil {
+				//     fmt.Println("    Failed reading page data:", err)
+				//     break
+				// }
 
-				// Sledeći page offset
+				// Sljedeći header dolazi odmah nakon kompresovanih podataka trenutne stranice
 				offset = pageDataOffset + int64(header.CompressedPageSize)
+				pageIdx++
 			}
+
+			fmt.Printf("  Column %d finished: valuesRead=%d / %d\n\n",
+				colIdx, valuesRead, numValuesTotal)
 		}
 	}
 }
