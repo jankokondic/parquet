@@ -4,13 +4,63 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"os"
 
 	"root/gen-go/parquet"
 
 	"github.com/apache/thrift/lib/go/thrift"
 )
+
+// countingReader čita direktno iz fajla preko ReadAt i broji koliko je bajtova pročitano.
+type countingReader struct {
+	f        *os.File
+	offset   int64 // početak header-a u fajlu
+	consumed int64 // koliko smo bajtova pročitali preko ovog reader-a
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.f.ReadAt(p, r.offset+r.consumed)
+	r.consumed += int64(n)
+	return n, err
+}
+
+// countingTransport je minimalna implementacija thrift.TTransport
+// koja wrapa naš countingReader. NEMA dodatnog buffera, pa je
+// cr.consumed TAČNO ono što je Thrift pročitao za header.
+type countingTransport struct {
+	r *countingReader
+}
+
+func (t *countingTransport) Read(p []byte) (int, error) {
+	return t.r.Read(p)
+}
+
+func (t *countingTransport) Write(p []byte) (int, error) {
+	// Ne pišemo ništa, ovo je read-only transport.
+	return 0, thrift.NewTTransportException(thrift.UNKNOWN_TRANSPORT_EXCEPTION, "write not supported")
+}
+
+func (t *countingTransport) Close() error {
+	return nil
+}
+
+func (t *countingTransport) Flush(ctx context.Context) error {
+	return nil
+}
+
+func (t *countingTransport) Open() error {
+	return nil
+}
+
+func (t *countingTransport) IsOpen() bool {
+	return true
+}
+
+// RemainingBytes: vratimo "no limit"
+func (t *countingTransport) RemainingBytes() uint64 {
+	// isto rade i drugi transporti kada nemaju hard limit
+	return ^uint64(0)
+}
 
 // Čita footer i dekodira FileMetaData
 func ReadParquetFooter(f *os.File) (*parquet.FileMetaData, error) {
@@ -59,38 +109,24 @@ func ReadParquetFooter(f *os.File) (*parquet.FileMetaData, error) {
 // - header: dekodirani PageHeader
 // - pageDataOffset: offset na početak kompresovanih podataka stranice
 func ReadPageHeaderAndDataOffset(f *os.File, offset int64) (*parquet.PageHeader, int64, error) {
-	const maxHeaderSize = 64 * 1024 // 64 KB, dovoljno za PageHeader
-
-	headerBuf := make([]byte, maxHeaderSize)
-	n, err := f.ReadAt(headerBuf, offset)
-	if err != nil && err != io.EOF {
-		return nil, 0, fmt.Errorf("failed reading potential page header bytes: %w", err)
-	}
-	if n == 0 {
-		return nil, 0, fmt.Errorf("no bytes read for page header at offset %d", offset)
+	cr := &countingReader{
+		f:      f,
+		offset: offset,
 	}
 
-	mem := thrift.NewTMemoryBufferLen(n)
-	_, err = mem.Write(headerBuf[:n])
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to write header bytes to memory buffer: %w", err)
-	}
+	// KORISTIMO naš countingTransport, NE StreamTransportR,
+	// da ne bi bilo dodatnog internog bufferinga.
+	ct := &countingTransport{r: cr}
 
-	beforeLen := mem.Len()
+	protocol := thrift.NewTCompactProtocolFactoryConf(&thrift.TConfiguration{}).GetProtocol(ct)
 
-	protocol := thrift.NewTCompactProtocolFactoryConf(&thrift.TConfiguration{}).GetProtocol(mem)
 	header := parquet.NewPageHeader()
 	if err := header.Read(context.Background(), protocol); err != nil {
 		return nil, 0, fmt.Errorf("failed reading page header: %w", err)
 	}
 
-	afterLen := mem.Len()
-	consumed := int64(beforeLen - afterLen)
-	if consumed <= 0 {
-		return nil, 0, fmt.Errorf("invalid consumed header length %d at offset %d", consumed, offset)
-	}
-
-	pageDataOffset := offset + consumed
+	// Thrift je pročitao tačno cr.consumed bajtova za header
+	pageDataOffset := offset + cr.consumed
 	return header, pageDataOffset, nil
 }
 
@@ -129,8 +165,7 @@ func main() {
 			var valuesRead int64
 			pageIdx := 0
 
-			// Glavna razlika: petlja ide dok ne pročitaš sve vrijednosti (NumValues),
-			// a NE dok offset < dataPageOffset + totalCompressedSize.
+			// Petlja ide dok ne pročitaš sve vrijednosti (NumValues)
 			for valuesRead < numValuesTotal {
 				header, pageDataOffset, err := ReadPageHeaderAndDataOffset(f, offset)
 				if err != nil {
@@ -161,7 +196,7 @@ func main() {
 					// DICTIONARY_PAGE, INDEX_PAGE itd. – ovdje ne mijenjamo valuesRead
 				}
 
-				// (Ako želiš čitati page data, ovdje bi išlo:)
+				// Ako želiš čitati page data, ovdje bi išlo:
 				// pageData := make([]byte, header.CompressedPageSize)
 				// _, err = f.ReadAt(pageData, pageDataOffset)
 				// if err != nil {
