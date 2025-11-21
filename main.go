@@ -113,6 +113,8 @@ func main() {
 					break
 				}
 
+				//dekompresovati sad treba te podatke
+
 				// Sledeći page offset
 				offset = pageDataOffset + int64(header.CompressedPageSize)
 			}
