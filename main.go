@@ -525,7 +525,6 @@ func ReadInt32ColumnChunkInto(meta *parquet.FileMetaData, f *os.File, col *parqu
 			if err != nil {
 				return fmt.Errorf("failed to decode dictionary page: %w", err)
 			}
-
 		case parquet.PageType_DATA_PAGE:
 			if header.DataPageHeader == nil {
 				return fmt.Errorf("DATA_PAGE but DataPageHeader is nil")
@@ -888,40 +887,43 @@ func main() {
 		panic(fmt.Errorf("failed to read parquet footer: %w", err))
 	}
 
-	for rgIdx, rg := range meta.RowGroups {
-		fmt.Println("RowGroup:", rgIdx)
+	bufInt := make([]int32, 1000000)
+	bufFloat := make([]float32, 1000000)
 
-		for colIdx, col := range rg.Columns {
+	for _, rg := range meta.RowGroups {
+		// fmt.Println("RowGroup:", rgIdx)
+
+		for _, col := range rg.Columns {
 			md := col.MetaData
 			if md == nil {
-				fmt.Println("  Column", colIdx, "has nil MetaData, skipping")
+				// fmt.Println("  Column", colIdx, "has nil MetaData, skipping")
 				continue
 			}
 
-			fmt.Println("  Column:", colIdx,
-				"path:", md.PathInSchema,
-				"physicalType:", md.Type,
-				"numValues:", md.NumValues,
-				"codec:", md.Codec)
+			// fmt.Println("  Column:", colIdx,
+			// "path:", md.PathInSchema,
+			// "physicalType:", md.Type,
+			// "numValues:", md.NumValues,
+			// "codec:", md.Codec)
 
-			numValues := int(md.NumValues)
+			// numValues := int(md.NumValues)
 
 			switch md.Type {
 			case parquet.Type_INT32:
-				buf := make([]int32, numValues)
-				if err := ReadInt32ColumnChunkInto(meta, f, col, buf); err != nil {
+				// buf := make([]int32, numValues)
+				if err := ReadInt32ColumnChunkInto(meta, f, col, bufInt); err != nil {
 					fmt.Println("    ERROR decoding INT32 column:", err)
 					return
 				}
-				fmt.Println("INT32 first 10:", buf[:10])
+				// fmt.Println("INT32 first 10:", buf[:10])
 
 			case parquet.Type_FLOAT:
-				buf := make([]float32, numValues)
-				if err := ReadFloatColumnChunkInto(meta, f, col, buf); err != nil {
+				// buf := make([]float32, numValues)
+				if err := ReadFloatColumnChunkInto(meta, f, col, bufFloat); err != nil {
 					fmt.Println("    ERROR decoding FLOAT column:", err)
 					return
 				}
-				fmt.Println("FLOAT first 10:", buf[:10])
+				// fmt.Println("FLOAT first 10:", buf[:10])
 
 			default:
 				fmt.Println("    (decoder not implemented for type:", md.Type, ")")
