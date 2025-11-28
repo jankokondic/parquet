@@ -1,0 +1,55 @@
+✔ 1. FIZIČKI (PHYSICAL) TIPOVI U PARQUETU
+
+(najniži nivo, direktno kako se bajtovi pišu u fajl)
+
+Parquet ima samo 10 fizičkih tipova:
+
+Fizčki tip	Opis	Veličina
+BOOLEAN	0/1 vrijednost	1 bit
+INT32	32-bitni integer	4 bajta
+INT64	64-bitni integer	8 bajtova
+INT96	96-bitni timestamp (stari Hive tip)	12 bajtova
+FLOAT	32-bitni float	4 bajta
+DOUBLE	64-bitni float	8 bajtova
+BYTE_ARRAY	varijabilna dužina bajtova	N bajtova
+FIXED_LEN_BYTE_ARRAY	fiksna dužina bajtova	definisana dužina
+(BOOLEAN je formalno “primitive type”, ali fizički se pakuje bitpacked)		
+
+
+✔ 2. LOGIČKI TIPOVI (LOGICAL TYPES / CONVERTED TYPES)
+
+Logički tip = “kako tumačiti fizičke bajtove”.
+
+Oni su opcioni, služe samo za semantiku.
+
+Najčešći logički tipovi:
+🔢 Brojevi
+Logički tip	Fizička podloga	Značenje
+INT_8, INT_16, INT_32, INT_64	INT32 ili INT64	mali integeri
+UINT_8, UINT_16, UINT_32, UINT_64	INT32/INT64	unsigned integeri
+DECIMAL	INT32 / INT64 / BYTE_ARRAY / FIXED	decimalni broj sa skalom
+FLOAT	FLOAT	isto kao physical
+DOUBLE	DOUBLE	isto kao physical
+📅 Datum i vreme
+Logički tip	Fizička podloga	Značenje
+DATE	INT32	broj dana od 1970-01-01
+TIME_MILLIS	INT32	vrijeme u ms
+TIME_MICROS	INT64	vrijeme u μs
+TIMESTAMP_MILLIS	INT64	epoch ms
+TIMESTAMP_MICROS	INT64	epoch μs
+INTERVAL	FIXED_LEN_BYTE_ARRAY(12)	kompleksni interval
+🧵 String / binary
+Logički tip	Fizička podloga	Značenje
+UTF8	BYTE_ARRAY	string
+JSON	BYTE_ARRAY	JSON
+BSON	BYTE_ARRAY	BSON
+UUID	FIXED_LEN_BYTE_ARRAY(16)	UUID
+
+Kompleksni tipovi
+
+Logički tipovi ne postoje samo za primitivne podatke:
+LIST → list struktura
+MAP → mapa ključeva i vrijednosti
+ENUM → enumeracija
+STRUCT → ugniježđeni objekti
+Ti tipovi ne imaju fizičke tipove — oni određuju kako su kolone organizovane.

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"sync"
 	"time"
 
 	"root/gen-go/parquet"
@@ -288,15 +287,38 @@ func decodeLevels(buf []byte, maxLevel int, numVals int) ([]int32, int, error) {
 	if maxLevel == 0 || numVals == 0 {
 		return nil, 0, nil
 	}
+
 	bitWidth := bitsNeeded(maxLevel)
 	if bitWidth == 0 {
 		return nil, 0, nil
 	}
-	levels, used, err := decodeRLEBitPackedHybridWithUsed(buf, bitWidth, numVals)
-	if err != nil {
-		return nil, 0, err
+
+	// Parquet RLE/BitPacked hibrid za def/rep levele:
+	// PRVO 4 bajta (little-endian) = dužina enkodiranog streama,
+	// PA ONDA ide RLE/BitPacked stream koji očekuje decodeRLEBitPackedHybridWithUsed.
+	if len(buf) < 4 {
+		return nil, 0, fmt.Errorf("decodeLevels: buffer too small for length prefix (len=%d)", len(buf))
 	}
-	return levels, used, nil
+
+	encodedLen := int(binary.LittleEndian.Uint32(buf[:4]))
+	if encodedLen < 0 || 4+encodedLen > len(buf) {
+		return nil, 0, fmt.Errorf("decodeLevels: invalid encoded length %d (buf len=%d)", encodedLen, len(buf))
+	}
+
+	stream := buf[4 : 4+encodedLen]
+
+	levels, usedInner, err := decodeRLEBitPackedHybridWithUsed(stream, bitWidth, numVals)
+	if err != nil {
+		return nil, 0, fmt.Errorf("decodeLevels: failed to decode RLE/BitPacked: %w", err)
+	}
+
+	// Teoretski usedInner bi trebao biti == encodedLen, ali za sigurnost:
+	_ = usedInner
+
+	// Potrošili smo TAČNO 4 + encodedLen bajtova u data stranici
+	usedTotal := 4 + encodedLen
+
+	return levels, usedTotal, nil
 }
 
 //
@@ -636,6 +658,7 @@ func decodeFloatPlainValuesFrom(buf []byte, defLevels []int32, maxDef int, numRo
 	pos := 0
 
 	if maxDef == 0 {
+
 		need := numRows * 4
 		if len(buf) < need {
 			return nil, 0, fmt.Errorf("uncompressed size %d too small for %d float32 values", len(buf), numRows)
@@ -865,75 +888,46 @@ func main() {
 		panic(fmt.Errorf("failed to read parquet footer: %w", err))
 	}
 
-	floatBuff := make([]float32, 2000000)
-	intBuff := make([]int32, 5000000)
-
-	var wg sync.WaitGroup
-
 	for rgIdx, rg := range meta.RowGroups {
 		fmt.Println("RowGroup:", rgIdx)
 
 		for colIdx, col := range rg.Columns {
-			wg.Add(1)
-			go func(wg *sync.WaitGroup) {
-				md := col.MetaData
-				if md == nil {
-					fmt.Println("  Column", colIdx, "has nil MetaData, skipping")
+			md := col.MetaData
+			if md == nil {
+				fmt.Println("  Column", colIdx, "has nil MetaData, skipping")
+				continue
+			}
+
+			fmt.Println("  Column:", colIdx,
+				"path:", md.PathInSchema,
+				"physicalType:", md.Type,
+				"numValues:", md.NumValues,
+				"codec:", md.Codec)
+
+			numValues := int(md.NumValues)
+
+			switch md.Type {
+			case parquet.Type_INT32:
+				buf := make([]int32, numValues)
+				if err := ReadInt32ColumnChunkInto(meta, f, col, buf); err != nil {
+					fmt.Println("    ERROR decoding INT32 column:", err)
 					return
 				}
+				fmt.Println("INT32 first 10:", buf[:10])
 
-				fmt.Println("  Column:", colIdx,
-					"path:", md.PathInSchema,
-					"physicalType:", md.Type,
-					"numValues:", md.NumValues,
-					"codec:", md.Codec)
-
-				switch md.Type {
-				case parquet.Type_INT32:
-					// buf := make([]int32, md.NumValues)
-					if err := ReadInt32ColumnChunkInto(meta, f, col, intBuff); err != nil {
-						fmt.Println("    ERROR decoding INT32 column:", err)
-						return
-					}
-
-					// limit := int(md.NumValues)
-					// intCounter += limit
-					// if len(buf) < limit {
-					// 	limit = len(buf)
-					// }
-					// fmt.Printf("    INT32 first %d values:", limit)
-					// for i := 0; i < limit; i++ {
-					// 	fmt.Printf(" %d", buf[i])
-					// }
-					// fmt.Println()
-
-				case parquet.Type_FLOAT:
-					// buf := make([]float32, md.NumValues)
-					if err := ReadFloatColumnChunkInto(meta, f, col, floatBuff); err != nil {
-						fmt.Println("    ERROR decoding FLOAT column:", err)
-						return
-					}
-					// limit := int(md.NumValues)
-					// floatCounter += limit
-					// if len(buf) < limit {
-					// limit = len(buf)
-					// }
-					// fmt.Printf("    FLOAT first %d values:", limit)
-					// for i := 0; i < limit; i++ {
-					// fmt.Printf(" %.2f", buf[i])
-					// }
-					// fmt.Println()
-
-				default:
-					fmt.Println("    (decoder not implemented for type:", md.Type, ")")
+			case parquet.Type_FLOAT:
+				buf := make([]float32, numValues)
+				if err := ReadFloatColumnChunkInto(meta, f, col, buf); err != nil {
+					fmt.Println("    ERROR decoding FLOAT column:", err)
+					return
 				}
+				fmt.Println("FLOAT first 10:", buf[:10])
 
-				wg.Done()
-			}(&wg)
+			default:
+				fmt.Println("    (decoder not implemented for type:", md.Type, ")")
+			}
 		}
 	}
-
-	wg.Wait()
 
 	// fmt.Println("int", intCounter, "float", floatCounter)
 	fmt.Println(time.Since(start))
